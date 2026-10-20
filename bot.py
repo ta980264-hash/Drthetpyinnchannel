@@ -1672,14 +1672,14 @@ def _actual_result_for_auto_pending(
     )
 
 
-async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> bool:
+async def _settle_auto_pending(bot, config: dict, channel_level: int | None, pending_override: dict | None = None) -> bool:
     """Use the NEW post's own (N) ladder label to read the SOURCE channel's
     outcome: (1) means the source's previous signal WON, any higher number
     means it LOST. But our bot may have posted the OPPOSITE of the source
     that round (reverse mode) — so our own win/loss is the source's outcome
     flipped whenever our pending signal was posted in "reverse" mode.
     Returns True if a pending signal was actually settled."""
-    pending = config.get("auto_pending")
+    pending = pending_override if pending_override is not None else config.get("auto_pending")
     if not isinstance(pending, dict) or not pending.get("transaction"):
         return False
 
@@ -1726,8 +1726,17 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
         config["auto_result_history"] = result_history[-120:]
         logger.info("Auto game result recorded: %s", actual_result)
 
-    config["auto_pending"] = None
-    save_channel_config(config)
+    if pending_override is not None:
+        # Background settlement: reload so the newly posted pending is kept.
+        config = load_channel_config()
+        if actual_result:
+            hist = [i for i in (config.get("auto_result_history") or []) if isinstance(i, str) and i in {"BIG", "SMALL"}]
+            hist.append(actual_result)
+            config["auto_result_history"] = hist[-120:]
+        save_channel_config(config)
+    else:
+        config["auto_pending"] = None
+        save_channel_config(config)
 
     if our_won:
         streak = mm_register_win()
@@ -1804,7 +1813,16 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     # Settle the previous pending signal using THIS post's (N) label —
     # accounting for whichever mode (source/reverse) that pending signal
     # was actually posted in.
-    await _settle_auto_pending(context.bot, config, channel_level)
+    # With a (N) tag, settlement is instant (no network). Without it, the old
+    # result is checked in the background so the new signal posts immediately.
+    background_pending = None
+    if channel_level:
+        await _settle_auto_pending(context.bot, config, channel_level)
+    else:
+        background_pending = config.get("auto_pending")
+        if background_pending:
+            config["auto_pending"] = None
+            save_channel_config(config)
     config = load_channel_config()
     # A missing result must never halt auto posting indefinitely. Once a newer
     # source post exists, discard the unresolved prior pending record without
@@ -1871,6 +1889,14 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
             await _send_text_retry(context.bot, int(chat_id), text)
         except Exception as error:
             logger.warning("Auto post failed for %s: %s", chat_id, error)
+
+    if isinstance(background_pending, dict):
+        async def _bg_settle(old=background_pending):
+            try:
+                await _settle_auto_pending(context.bot, load_channel_config(), None, pending_override=old)
+            except Exception:
+                logger.exception("Background auto settle failed")
+        asyncio.create_task(_bg_settle())
 
 
 async def auto_post_loop(app: Application):
