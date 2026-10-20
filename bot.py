@@ -1006,7 +1006,7 @@ async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
     }
     try:
         async with httpx.AsyncClient(
-            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+            timeout=3.0,
             follow_redirects=True,
             headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
         ) as client:
@@ -1234,20 +1234,31 @@ def parse_signal_and_level_from_text(text: str) -> tuple[str | None, int | None]
     return parse_signal_from_text(text), None
 
 def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | None, int | None]]:
-    """Extract signal text and its public post time from t.me/s HTML."""
-    texts = re.findall(
-        r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
+    """Extract signal text and its public post time from t.me/s HTML message blocks."""
+    blocks = re.findall(
+        r'<div[^>]*class="[^"]*tgme_widget_message_wrap[^"]*"[^>]*>(.*?)(?=<div[^>]*class="[^"]*tgme_widget_message_wrap|$)',
         page,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
     posts: list[tuple[datetime, str, str | None, int | None]] = []
-    for raw_text, raw_time in zip(texts, times):
+    for block in blocks:
+        text_m = re.search(
+            r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not text_m:
+            continue
+        raw_text = text_m.group(1)
         signal, level = parse_signal_and_level_from_text(raw_text)
         if not signal:
             continue
+
+        time_m = re.search(r'<time datetime="([^"]+)"', block, flags=re.IGNORECASE)
+        if not time_m:
+            continue
         try:
-            post_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            post_time = datetime.fromisoformat(time_m.group(1).replace("Z", "+00:00"))
         except ValueError:
             continue
         if post_time.tzinfo is None:
@@ -1275,9 +1286,9 @@ async def fetch_latest_public_channel_signal() -> str | None:
     for source_url in urls:
         try:
             async with httpx.AsyncClient(
-                timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+                timeout=5.0,
                 follow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 signal-bot-public-reader"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"},
             ) as client:
                 response = await client.get(source_url)
                 response.raise_for_status()
@@ -1672,32 +1683,38 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
     if not isinstance(pending, dict) or not pending.get("transaction"):
         return False
 
-    # Prefer the game's own result endpoint.  The source channel level is only
-    # a fallback because it describes whether the source prediction won; it
-    # is not itself the BIG/SMALL game result.
-    actual_result, actual_number = await fetch_game_result(
-        str(pending.get("transaction"))
-    )
-    if actual_result:
-        our_won = pending.get("signal") == actual_result
-        logger.info(
-            "Game result read for %s: %s%s",
-            pending.get("transaction"),
-            actual_result,
-            f" ({actual_number})" if actual_number else "",
-        )
-    else:
-        if not channel_level:
-            logger.warning(
-                "No game result available yet for %s; keeping auto signal pending",
-                pending.get("transaction"),
-            )
-            return False
+    # Fast-path settlement: The source channel post already tells whether the previous
+    # round won or lost via its (1) vs (2, 3...) level tag. Using this avoids
+    # waiting for slow/failing external game result HTTP calls before posting!
+    actual_number = None
+    if channel_level:
         actual_result = _actual_result_for_auto_pending(pending, int(channel_level))
         our_won = (
             actual_result is not None
             and pending.get("signal") == actual_result
         )
+        logger.info(
+            "Auto signal settled instantly via channel level (%s): %s (won=%s)",
+            channel_level, actual_result, our_won
+        )
+    else:
+        actual_result, actual_number = await fetch_game_result(
+            str(pending.get("transaction"))
+        )
+        if actual_result:
+            our_won = pending.get("signal") == actual_result
+            logger.info(
+                "Game result read for %s: %s%s",
+                pending.get("transaction"),
+                actual_result,
+                f" ({actual_number})" if actual_number else "",
+            )
+        else:
+            logger.warning(
+                "No game result available yet for %s; keeping auto signal pending",
+                pending.get("transaction"),
+            )
+            return False
 
     if actual_result:
         result_history = [
@@ -1864,7 +1881,7 @@ async def auto_post_loop(app: Application):
             raise
         except Exception:
             logger.exception("Auto-post loop error")
-        await asyncio.sleep(15)
+        await asyncio.sleep(2)
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
